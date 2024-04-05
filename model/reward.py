@@ -17,6 +17,7 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
         self.model = LlamaModel(config)
         self.v_head = nn.Linear(config.hidden_size, 1, bias=False)
         self.PAD_ID = 0
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -28,6 +29,9 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
 
     def set_format_fn(self, format_fn):
         self.format_fn = format_fn
+    
+    def get_lm_head(self):
+        return self.lm_head
 
     def forward(
         self,
@@ -115,8 +119,8 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
         encodings_dict = self.tokenizer(
             samples,
             truncation=True,
-            max_length=2048,
-            padding="max_length",
+            max_length=4000,
+            padding="longest",
             return_tensors="pt",
         ).to(self.get_device())
         input_ids = encodings_dict["input_ids"]

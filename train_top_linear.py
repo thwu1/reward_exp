@@ -3,6 +3,10 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import json
 import time
+import argparse
+from model.reward import get_reward_model
+from copy import deepcopy
+from transformers import AutoTokenizer
 
 def pl_loss(pred):
     # Implementation of Plackett-Luce loss
@@ -46,39 +50,6 @@ def consecutive_accuracy(pred):
     _, responses_per_prompt = pred.shape
     acc_rate = sum(sum(pred[:, :-1] > pred[:, 1:])) / (len(pred) * (responses_per_prompt - 1))
     return acc_rate
-tag = "v2"
-layer = 32
-train_file = [f"/data/tianhao/reward_bootstrap/hidden_states_reward_cleaned_{i}_{tag}.pt" for i in range(1)]
-# test_file = [f"/data/tianhao/reward_bootstrap/hidden_states_{i}.pt" for i in range(100, 101)]
-truth_file = f"/data/tianhao/reward_bootstrap/hidden_states_truthful_0_{tag}.pt"
-preference_file = f"/data/tianhao/reward_bootstrap/hidden_states_preference_0_{tag}.pt"
-safety_file = f"/data/tianhao/reward_bootstrap/hidden_states_safety_0_{tag}.pt"
-
-train_dict = []
-for file in train_file:
-    train_dict.extend(torch.load(file))
-
-# test_dict = []
-# for file in test_file:
-#     test_dict.extend(torch.load(file))
-
-print("train dict length", len(train_dict))
-# print("test dict length", len(test_dict))
-
-train_dict_layer = [item[f"layer_{layer}"] for item in train_dict]
-train_loader = DataLoader(train_dict_layer, batch_size=512, shuffle=False, drop_last=False)
-
-# test_dict_layer = [item[f"layer_{layer}"] for item in test_dict]
-# test_loader = DataLoader(test_dict_layer, batch_size=512, shuffle=False, drop_last=False)
-
-truth_dict = torch.load(truth_file)
-truth_loader = DataLoader([item[f"layer_{layer}"] for item in truth_dict], batch_size=512, shuffle=False, drop_last=False)
-
-preference_dict = torch.load(preference_file)
-preference_loader = DataLoader([item[f"layer_{layer}"] for item in preference_dict], batch_size=512, shuffle=False, drop_last=False)
-
-safety_dict = torch.load(safety_file)
-safety_loader = DataLoader([item[f"layer_{layer}"] for item in safety_dict], batch_size=512, shuffle=False, drop_last=False)
 
 def loss_fn(pred):
     return pl_loss(pred)
@@ -163,6 +134,78 @@ class ValueHead(nn.Module):
     def load(self, path):
         self.load_state_dict(torch.load(path))
 
-v_head = ValueHead(4096)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tag", type=str)
+    parser.add_argument("--layer", type=int, default=32)
+    args = parser.parse_args()
 
-train(model=v_head, train_loader=train_loader, test_loader=None, epochs=1000)
+    tag = args.tag
+    layer = args.layer
+    model_name = "meta-llama/Llama-2-7b-chat-hf"
+    train_file = [f"/data/tianhao/reward_bootstrap/hidden_states_reward_cleaned_{i}_{tag}.pt" for i in range(1)]
+    # test_file = [f"/data/tianhao/reward_bootstrap/hidden_states_{i}.pt" for i in range(100, 101)]
+    truth_file = f"/data/tianhao/reward_bootstrap/hidden_states_truthful_0_{tag}.pt"
+    preference_file = f"/data/tianhao/reward_bootstrap/hidden_states_preference_0_{tag}.pt"
+    safety_file = f"/data/tianhao/reward_bootstrap/hidden_states_safety_0_{tag}.pt"
+
+    train_dict = []
+    for file in train_file:
+        train_dict.extend(torch.load(file))
+
+    # test_dict = []
+    # for file in test_file:
+    #     test_dict.extend(torch.load(file))
+
+    print("train dict length", len(train_dict))
+    # print("test dict length", len(test_dict))
+
+    train_dict_layer = [item[f"layer_{layer}"] for item in train_dict]
+    train_loader = DataLoader(train_dict_layer, batch_size=512, shuffle=False, drop_last=False)
+
+    # test_dict_layer = [item[f"layer_{layer}"] for item in test_dict]
+    # test_loader = DataLoader(test_dict_layer, batch_size=512, shuffle=False, drop_last=False)
+
+    truth_dict = torch.load(truth_file)
+    truth_loader = DataLoader([item[f"layer_{layer}"] for item in truth_dict], batch_size=512, shuffle=False, drop_last=False)
+
+    preference_dict = torch.load(preference_file)
+    preference_loader = DataLoader([item[f"layer_{layer}"] for item in preference_dict], batch_size=512, shuffle=False, drop_last=False)
+
+    safety_dict = torch.load(safety_file)
+    safety_loader = DataLoader([item[f"layer_{layer}"] for item in safety_dict], batch_size=512, shuffle=False, drop_last=False)
+
+    v_head = ValueHead(4096)
+
+    reward_model = get_reward_model(model_name)
+    lm_head = deepcopy(reward_model.get_lm_head())
+    del reward_model
+
+    train(model=v_head, train_loader=train_loader, test_loader=None, epochs=1000)
+
+    v_head.save(f"/data/tianhao/reward_bootstrap/value_head_{tag}_{layer}.pt")
+    v_head.load(f"/data/tianhao/reward_bootstrap/value_head_{tag}_{layer}.pt")
+
+    # calculate the dot product of the v_head and lm_head (treat v_head as a token)
+    # and rank the dot product to get the most similar k tokens
+    k = 20
+
+    def get_most_similar_tokens(v_head, lm_head, k=10):
+        # Convert v_head to a tensor
+        v_head_tensor = v_head.detach()
+
+        # Calculate the dot product between v_head and each token in lm_head
+        dot_products = lm_head(v_head_tensor).squeeze(0)
+
+        # Get the indices of the top k tokens with the highest dot products
+        top_k_indices = torch.topk(dot_products, k=k, dim=0).indices
+
+        return top_k_indices
+
+    top_tokens = get_most_similar_tokens(v_head.fc.weight, lm_head, k=k)
+    print("Top", k, "most similar tokens:", top_tokens)
+
+    # decode the top k tokens
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    top_tokens_decoded = tokenizer.convert_ids_to_tokens(top_tokens)
+    print("Top", k, "most similar tokens (decoded):", top_tokens_decoded)
